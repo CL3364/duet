@@ -91,6 +91,11 @@ yourself.
 > the paths written in `SKILL.md`. Clone anywhere and point Claude at it, or
 > symlink: `ln -s /path/to/duet ~/.claude/skills/duet`.
 
+> **Uploading to Claude.ai instead of Claude Code?** That path takes a zipped
+> skill folder, and expects it to contain only the skill. Strip `README.md`,
+> `docs/`, `tests/` and `.git/` before zipping — Claude Code ignores them, but
+> the upload path does not want them.
+
 ---
 
 ## Three ways to run it
@@ -370,7 +375,6 @@ are in **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**.
 | [CONTEXT.md](CONTEXT.md) | Glossary. One term, one meaning |
 | [docs/PLAYBOOK.md](docs/PLAYBOOK.md) | How to get real work out of the loop |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Every failure and its fix |
-| [docs/decisions/](docs/decisions/README.md) | Decisions that would otherwise look arbitrary |
 | [references/trigger-tests.md](references/trigger-tests.md) | Phrases `/duet` must and must not fire on |
 | `bin/duet` | The relay — one Python file, stdlib only |
 | `prompts/` | The two role prompts, designer and engineer |
