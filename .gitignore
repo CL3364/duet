@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# a section's own war room, if you ever run duet inside this clone
+.duet/

@@ -1,0 +1,7 @@
+{"type": "thread.started", "thread_id": "01999999-aaaa-7bbb-8ccc-0123456789ab"}
+{"type": "turn.started"}
+{"type": "item.started", "item": {"id": "cmd_x", "type": "command_execution", "command": "cat README.md", "exit_code": 0, "aggregated_output": "", "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "cmd_x", "type": "command_execution", "command": "cat README.md", "exit_code": 0, "aggregated_output": "", "status": "completed"}}
+{"type": "item.completed", "item": {"id": "fc_x", "type": "file_change", "status": "completed", "changes": [{"kind": "edit", "path": "docs/install.md"}]}}
+{"type": "item.completed", "item": {"id": "msg_x", "type": "agent_message", "text": "Install docs now name the codex-cli minimum version.\nEVIDENCE: docs/install.md:12\nVERDICT: SHIP"}}
+{"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 20, "reasoning_output_tokens": 10}}

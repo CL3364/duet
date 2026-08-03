@@ -1,0 +1,1473 @@
+#!/usr/bin/env python3
+"""duet — Claude (designer) <-> Codex (engineer) executive relay.
+
+Two peers, one war room: .duet/DESIGN.md (designer-owned), the repo
+(engineer-owned), .duet/REVIEW.md (relay-owned, append-only). The relay
+mechanically enforces the conversation protocol:
+
+  - density-steered entries, no hard caps (anti over-conversation)
+  - CLOSE requires EVIDENCE; SHIP forbidden while your own items are open
+    (anti phantom-agreement)
+  - scope freeze after round N (new items need REGRESSION + EVIDENCE)
+  - round cap, dual-SHIP termination, BLOCKED -> human
+
+Privacy: Codex runs in a dedicated CODEX_HOME (~/.duet/codex-home), never
+~/.codex. Its sessions/history are wiped at the end of every section, so the
+only durable record is local files in the repo. Nothing is ever sent to Codex
+cloud; exec-mode CLI sessions do not appear in the ChatGPT web UI.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+DUET_HOME = Path(os.environ.get("DUET_HOME", str(Path.home() / ".duet")))
+CODEX_HOME = Path(os.environ.get("DUET_CODEX_HOME", str(DUET_HOME / "codex-home")))
+REAL_CODEX_HOME = Path.home() / ".codex"
+SKILL_DIR = Path(__file__).resolve().parent.parent
+
+OUTPUT_CONTRACT = """=== OUTPUT CONTRACT ===
+Do your work with your tools first, and form your own position from the
+war-room files and the actual code/diff BEFORE weighing the other side's
+latest entry — their framing is input to reconcile with, not your starting
+point.
+
+Your FINAL message is exactly one review entry, nothing else.
+
+How to write the prose (no length limit — density is the rule):
+- Lead with your conclusion, then the evidence that supports it, any
+  material caveat, and the next action. Omit introductions, repetition,
+  generic reassurance, and anything the other side already knows.
+- Keep it short by leaving things out, not by compressing into fragments:
+  a point that changes what the other side does next belongs; everything
+  else does not. Prefer file:line references over pasted code.
+- Settled points are settled. Do not re-affirm, restate, or praise them —
+  silence is agreement. Judge claims by their content and evidence, not by
+  who said them or how confidently.
+
+Structured lines (each on its own line, where applicable):
+    OPEN-{NEXT_ID}: <new contention that changes behavior, correctness, cost, or security>
+    CLOSE OPEN-<id>          (only items you yourself raised)
+    EVIDENCE: <verifiable: test log path, measurement, spec/file:line>
+    REGRESSION: <required to justify new OPEN items after the freeze round>
+    NITS: <non-blocking polish; may never block SHIP>
+Last line, exactly one of:
+    VERDICT: SHIP
+    VERDICT: CONTINUE
+    VERDICT: BLOCKED: <the one decision only the human can make>
+
+Structural invariants (relay-enforced; violations bounce back):
+- CLOSE requires an EVIDENCE line in the same entry.
+- You cannot SHIP while an item YOU raised is still open — that is phantom
+  agreement and the relay rejects the entry.
+- Filler courtesies ("great point", "you're absolutely right", thanks,
+  apologies) bounce.
+
+Verdict decision rule: after your review, ask whether the mission is now met
+with evidence in hand. If yes, SHIP — do not manufacture commentary to seem
+thorough. If a needed fact is missing, name it instead of padding. If
+evidence cannot settle a disagreement, BLOCKED beats another round of prose."""
+
+VERDICT_RE = re.compile(r"^VERDICT:\s*(SHIP|CONTINUE|BLOCKED:?\s*.*?)\s*$", re.M)
+RAISE_RE = re.compile(r"^OPEN-(\d+):\s*(.+)$", re.M)
+CLOSE_RE = re.compile(r"^CLOSE\s+OPEN-(\d+)\s*$", re.M)
+EVID_RE = re.compile(r"^EVIDENCE:\s*\S", re.M)
+REGR_RE = re.compile(r"^REGRESSION:\s*\S", re.M)
+BANNED = ["great point", "great question", "you're absolutely right",
+          "you are absolutely right", "thanks for", "thank you"]
+
+# Codex reports plan/thinking progress with step markers ("step 3/7",
+# "step 3 of 7"). Only these numbers are ever extracted from its reasoning —
+# the text itself is never displayed or stored anywhere. Deliberately
+# word-anchored: bare fractions ("tests 22/22 passed", dates, "(3/7)") must
+# not register as steps; the plan tool (todo_list events) is the primary
+# source and needs no markers. Latest valid marker in the text wins.
+STEP_WORD_RE = re.compile(r"\bstep\s+(\d{1,2})\s*(?:/|of)\s*(\d{1,2})\b", re.I)
+
+
+def extract_step(text):
+    last = None
+    for m in STEP_WORD_RE.finditer(text or ""):
+        n, total = int(m.group(1)), int(m.group(2))
+        if 1 <= n <= total and 2 <= total <= 50:
+            last = (n, total)
+    return last
+
+
+class TurnError(Exception):
+    pass
+
+
+def now_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def die(msg, code=1):
+    print(f"duet: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------- protocol guards ----------------
+
+def validate_entry(text, role, state):
+    errs = []
+    verdicts = VERDICT_RE.findall(text)
+    if len(verdicts) != 1:
+        errs.append("exactly one VERDICT line required "
+                    "(VERDICT: SHIP | CONTINUE | BLOCKED: <reason>)")
+    low = text.lower()
+    for phrase in BANNED:
+        if phrase in low:
+            errs.append(f'banned filler phrase: "{phrase}"')
+    opens = state["open_items"]
+    raised = RAISE_RE.findall(text)
+    closed = CLOSE_RE.findall(text)
+    has_evidence = bool(EVID_RE.search(text))
+    for oid, _ in raised:
+        if oid in opens:
+            errs.append(f"OPEN-{oid} already used; next available id is "
+                        f"OPEN-{state['next_open_id']}")
+    if raised and state["round"] > state["freeze_round"]:
+        if not (REGR_RE.search(text) and has_evidence):
+            errs.append("scope is frozen: new OPEN items now require "
+                        "REGRESSION: and EVIDENCE: lines")
+    if closed and not has_evidence:
+        errs.append("CLOSE without EVIDENCE — cite the test output, "
+                    "measurement, or spec/file:line that settles it")
+    for oid in closed:
+        if oid not in opens or opens[oid]["status"] != "open":
+            errs.append(f"CLOSE OPEN-{oid}: no such open item")
+        elif opens[oid]["raiser"] != role:
+            errs.append(f"OPEN-{oid} was raised by the {opens[oid]['raiser']}; "
+                        "only its raiser closes it")
+    if verdicts and verdicts[0].strip() == "SHIP":
+        still_open = [oid for oid, item in opens.items()
+                      if item["status"] == "open" and item["raiser"] == role
+                      and oid not in closed]
+        if still_open:
+            errs.append("SHIP while your own items are open ("
+                        + ", ".join("OPEN-" + o for o in still_open)
+                        + ") — that is phantom agreement; close them with "
+                          "EVIDENCE or keep VERDICT: CONTINUE")
+    return errs
+
+
+def apply_entry(text, role, state):
+    for oid, desc in RAISE_RE.findall(text):
+        state["open_items"][oid] = {"raiser": role, "text": desc.strip(),
+                                    "status": "open"}
+        state["next_open_id"] = max(state["next_open_id"], int(oid) + 1)
+    for oid in CLOSE_RE.findall(text):
+        state["open_items"][oid]["status"] = "closed"
+    verdict = VERDICT_RE.search(text).group(1).strip()
+    state["last_verdict"][role] = verdict
+    state["last_entry"][role] = text
+    return verdict
+
+
+def open_items(state):
+    return {k: v for k, v in state["open_items"].items()
+            if v["status"] == "open"}
+
+
+def dual_ship(state):
+    return (state["last_verdict"].get("designer") == "SHIP"
+            and state["last_verdict"].get("engineer") == "SHIP"
+            and not open_items(state))
+
+
+# ---------------- war room files ----------------
+
+def duet_dir(state):
+    return Path(state["repo"]) / ".duet"
+
+
+def append_entry(state, role, text):
+    header = f"\n## R{state['round']} · {role.upper()} · {now_utc()}\n\n"
+    with (duet_dir(state) / "REVIEW.md").open("a") as f:
+        f.write(header + text.strip() + "\n")
+
+
+def save_state(state):
+    (duet_dir(state) / "state.json").write_text(json.dumps(state, indent=2))
+
+
+def load_state(repo):
+    p = Path(repo).resolve() / ".duet" / "state.json"
+    if not p.exists():
+        die(f"no active section in {repo} (missing {p}); run `duet start` "
+            "or `duet run --mission ...` first")
+    return json.loads(p.read_text())
+
+
+def fresh_state(args, repo):
+    # pid suffix: same-second launches must not share log/progress paths
+    sid = datetime.now().strftime("s%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    d = repo / ".duet"
+    if (d / "state.json").exists():
+        die("a section is already in flight here; finish it (`duet end`), "
+            "continue it (`duet run --continue`), or delete .duet/state.json")
+    (d / "sections").mkdir(parents=True, exist_ok=True)
+    design = d / "DESIGN.md"
+    if not design.exists():
+        design.write_text("# DESIGN\n\n_(designer-owned; written in round 1)_\n")
+    with (d / "REVIEW.md").open("a") as f:
+        f.write(f"\n# Section {sid} — {args.mission}\n")
+    return {"section": sid, "mission": args.mission, "round": 1,
+            "open_items": {}, "next_open_id": 1,
+            "last_entry": {}, "last_verdict": {},
+            "repo": str(repo), "rounds": args.rounds,
+            "freeze_round": args.freeze,
+            "codex_session": None, "claude_session": None,
+            "claude_model": None}  # set only once a fallback becomes sticky
+
+
+# ---------------- model runners ----------------
+
+def log_path(state, name):
+    p = DUET_HOME / "logs" / state["section"] / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def progress_path(section):
+    return DUET_HOME / "logs" / section / "progress.json"
+
+
+def progress_log_path(section):
+    """Append-only log of every progress transition.
+
+    progress.json is a last-write-wins snapshot, so two changes inside one
+    `duet progress --follow` poll window used to collapse into one and the
+    step in between was lost forever. The follower tails this file by byte
+    offset instead, so it cannot miss a transition however fast they arrive.
+    """
+    return DUET_HOME / "logs" / section / "progress.jsonl"
+
+
+def driver_lease_path(section):
+    return DUET_HOME / "logs" / section / "driver.lock"
+
+
+def acquire_driver_lease(section):
+    """Hold a section-scoped lease for this driver's full process lifetime.
+
+    Drivers take shared locks and followers probe exclusively. Multiple
+    accidentally-overlapping drivers therefore still keep the monitor alive,
+    while a follower's momentary probe cannot make a driver fail to start.
+    The persistent file must never be unlinked: kernel lock release, including
+    on SIGKILL and while the dead process is still a zombie, is the signal.
+    """
+    p = driver_lease_path(section)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lease = p.open("a")
+    fcntl.flock(lease, fcntl.LOCK_SH)
+    return lease
+
+
+def release_driver_lease(lease):
+    if lease is None:
+        return
+    try:
+        fcntl.flock(lease, fcntl.LOCK_UN)
+    finally:
+        lease.close()
+
+
+def driver_lease_alive(section):
+    """True/False for a lease-aware section, None for a legacy/unknown one."""
+    p = driver_lease_path(section)
+    if not p.exists():
+        return None
+    try:
+        probe = p.open("r")
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return None
+        fcntl.flock(probe, fcntl.LOCK_UN)
+        return False
+    finally:
+        probe.close()
+
+
+# Per (section, round) step bookkeeping, driver-process only. Codex can report
+# plan completion in batches, so replaying only the reported states can skip
+# intermediate steps. STEP_TRACK fills the steps completed between two reports
+# and keeps the counter monotonic when Codex rewrites its plan mid-turn (a
+# rewrite can shrink `total`).
+#
+# The step is the ONLY thing that reaches the human. Tool-call and file-edit
+# counters are intentionally omitted because repeated activity within a step
+# does not add user-actionable progress.
+# A turn with no step counter is a turn where codex ignored its plan tool —
+# fix that in prompts/engineer.md, not by padding this feed.
+STEP_TRACK = {}
+LAST_LINE = {}
+
+
+def _pkey(state):
+    return (state["section"], state["round"])
+
+
+def progress_reset(state):
+    """Start-of-attempt reset: a retry re-plans from scratch."""
+    STEP_TRACK.pop(_pkey(state), None)
+
+
+def progress_update(state, kind="status", **fields):
+    """Record codex step progress (numbers only) for `duet progress`: refresh
+    the snapshot, and append a transition record whenever the line it renders
+    changes."""
+    section = state["section"]
+    p = progress_path(section)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data.update(fields)
+    data["kind"] = kind
+    data["round"] = state["round"]
+    # the follower watches this exact pid: a concurrent section's driver must
+    # neither hold it open nor let it exit early
+    data["driver_pid"] = os.getpid()
+    data["updated"] = now_utc()
+    p.write_text(json.dumps(data))
+    line = progress_line(data)
+    if LAST_LINE.get(section) == line:
+        return
+    try:
+        with progress_log_path(section).open("a") as f:
+            f.write(json.dumps(data) + "\n")
+    except OSError:
+        return  # progress is best-effort and never takes a turn down — but
+        # don't record the line as delivered, or a transient write failure
+        # would drop that step from the follower permanently
+    LAST_LINE[section] = line
+
+
+def note_step(state, step, total):
+    """Advance the step counter to `step`, emitting one transition per step
+    codex actually completed — including the ones it only told us about in a
+    later batch — and never rewinding if it rewrites its plan."""
+    try:
+        step, total = int(step), int(total)
+    except (TypeError, ValueError):
+        return
+    key = _pkey(state)
+    tr = STEP_TRACK.setdefault(key, {"step": 0, "total": 0})
+    total = max(total, tr["total"])
+    step = max(1, min(step, total))
+    if step <= tr["step"]:
+        if total != tr["total"]:  # plan grew: keep the denominator honest
+            tr["total"] = total
+            progress_update(state, kind="step", step=tr["step"],
+                            total=total, status="working")
+        return
+    for s in range(tr["step"] + 1, step + 1):
+        progress_update(state, kind="step", step=s, total=total,
+                        status="working")
+    tr["step"], tr["total"] = step, total
+
+
+def newest_codex_session():
+    root = CODEX_HOME / "sessions"
+    if not root.is_dir():
+        return None
+    files = sorted(root.rglob("rollout-*.jsonl"),
+                   key=lambda p: p.stat().st_mtime)
+    if not files:
+        return None
+    m = re.search(r"rollout-.+-([0-9a-f-]{36})\.jsonl$", files[-1].name)
+    return m.group(1) if m else None
+
+
+def render_event(state, line):
+    """Render one codex --json event into the live dialogue feed."""
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return  # codex banner/noise; already captured in the log
+    if not isinstance(ev, dict):
+        return  # bare JSON scalar/array — not an event
+    t = ev.get("type", "")
+    item = ev.get("item", {})
+    if not isinstance(item, dict):
+        item = {}
+    it = item.get("type", "")
+    if it == "todo_list":
+        # Codex's plan tool: current step = first uncompleted item. Plan
+        # advancement arrives as item.updated mid-turn, not only completed —
+        # and in batches, so note_step fills whatever it skipped over.
+        items = item.get("items") or []
+        if items:
+            done = sum(1 for i in items if i.get("completed"))
+            note_step(state, done + 1, len(items))
+        return
+    if "reasoning" in it:
+        # Any reasoning-flavored item type, any lifecycle phase: never
+        # displayed — only a "step 3/7" marker feeds `duet progress`.
+        st = extract_step(item.get("text") or item.get("summary") or "")
+        if st:
+            note_step(state, st[0], st[1])
+        return
+    if t == "thread.started":
+        if not state.get("codex_session"):
+            state["codex_session"] = ev.get("thread_id")
+        emit(f"  [codex session {str(ev.get('thread_id'))[:13]}…]")
+    elif t == "item.started" and it == "command_execution":
+        emit(f"  $ {item.get('command', '')}")
+    elif t == "item.completed":
+        if it == "command_execution":
+            code = item.get("exit_code")
+            if code not in (0, None):
+                emit(f"    ↳ exit {code}")
+        elif it == "file_change":
+            for ch in item.get("changes", []) or []:
+                emit(f"  ✎ {ch.get('kind', 'edit')} {ch.get('path', '')}")
+        elif it == "agent_message":
+            # GPT-5.6 emits mid-turn progress notes as agent_message items
+            # too; only the final one is the reply (captured separately via
+            # --output-last-message), so label these neutrally.
+            txt = item.get("text", "")
+            st = extract_step(txt)
+            if st:
+                note_step(state, st[0], st[1])
+            emit_block(f"CODEX · R{state['round']}", txt)
+        else:
+            txt = str(item.get("text") or item.get("command") or "")[:200]
+            if txt:
+                emit(f"  [{it}] {txt}")
+    elif t == "turn.completed":
+        u = ev.get("usage", {})
+        progress_update(state, status="turn-complete")
+        emit(f"  [tokens in/out/reasoning: {u.get('input_tokens')}/"
+             f"{u.get('output_tokens')}/{u.get('reasoning_output_tokens')}]")
+    elif t == "error":
+        emit(f"  [codex error] {ev.get('message', '')}")
+
+
+def is_reasoning_line(line):
+    """True for --json lines carrying reasoning (any lifecycle phase, any
+    reasoning-flavored item type, plus unparseable fragments that mention
+    one — fail closed); these are dropped from the debug log so thoughts
+    persist nowhere the relay writes."""
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return '"reasoning' in line
+    if not isinstance(ev, dict):
+        return False
+    item = ev.get("item")
+    if not isinstance(item, dict):
+        return False
+    return "reasoning" in str(item.get("type", ""))
+
+
+def run_codex(state, args, prompt):
+    CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, CODEX_HOME=str(CODEX_HOME))
+    log = log_path(state, f"r{state['round']}-engineer.log")
+    msg = log.with_suffix(".last.txt")
+    msg.unlink(missing_ok=True)
+    # codex-cli >= 0.144: exec-level flags must precede the `resume` subcommand
+    # (`codex exec resume` itself only accepts -c/--last/session args).
+    cmd = [args.codex_bin, "exec", "--json",
+           "--skip-git-repo-check", "-s", args.codex_sandbox,
+           "-C", state["repo"], "--output-last-message", str(msg)]
+    if args.codex_model:
+        cmd += ["-m", args.codex_model]
+    if args.codex_net:
+        cmd += ["-c", "sandbox_workspace_write.network_access=true"]
+    if state.get("codex_session"):
+        cmd += ["resume", state["codex_session"]]
+    cmd += [prompt]
+    for attempt in (1, 2):
+        progress_reset(state)  # a retry re-plans from step 1
+        progress_update(state, kind="status", step=None, total=None,
+                        status="thinking")
+        timed_out = [False]
+        with log.open("a") as lf:
+            lf.write(f"--- attempt {attempt} ---\n")
+            # stdin=DEVNULL: codex exec concatenates piped stdin into the prompt
+            # and blocks until EOF ("Reading additional input from stdin...");
+            # an inherited background-shell pipe may never close, hanging the turn.
+            proc = subprocess.Popen(cmd, env=env, text=True,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=lf)
+            def _kill():
+                timed_out[0] = True
+                proc.kill()
+            watchdog = None
+            if args.turn_timeout > 0:
+                watchdog = threading.Timer(args.turn_timeout, _kill)
+                watchdog.start()
+            try:
+                for line in proc.stdout:
+                    if not is_reasoning_line(line):
+                        lf.write(line)
+                    render_event(state, line)
+                rc = proc.wait()
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
+        if timed_out[0]:
+            progress_update(state, status="turn-failed")
+            raise TurnError(f"codex turn exceeded {args.turn_timeout}s")
+        if rc == 0 and msg.exists():
+            break
+        if attempt == 2:
+            progress_update(state, status="turn-failed")
+            hint = ""
+            if rc in (137, -9):
+                hint = (" (exit 137 = SIGKILL: if this is running inside "
+                        "another sandbox, run duet from a plain terminal or "
+                        "set DUET_CODEX_SANDBOX=danger-full-access)")
+            raise TurnError(f"codex exec failed twice, exit {rc}{hint}; "
+                            f"log: {log}")
+    if not state.get("codex_session"):
+        state["codex_session"] = newest_codex_session()
+    return msg.read_text().strip()
+
+
+# The designer runs on the primary model until its usage is exhausted, then
+# on the fallback for the rest of the section. Quota exhaustion is the ONLY
+# thing that triggers the switch, and the switch is always announced in the
+# feed — a silent downgrade mid-section is a quality drop the human can't see.
+USAGE_LIMIT_RE = re.compile(
+    r"usage limit|rate.?limit|limit reached|out of (?:usage|credits?)|"
+    r"quota|insufficient (?:quota|credits?)|\b429\b", re.I)
+
+
+def model_served(requested, served_ids):
+    """True if one of the ids the API actually billed matches what we asked
+    for ('fable' vs 'claude-fable-5-…')."""
+    alias = (requested or "").split("-")[0].lower()
+    return not alias or any(alias in s.lower() for s in served_ids)
+
+
+def claude_once(state, args, prompt, model):
+    """One designer turn. Returns (entry, None) or (None, error text)."""
+    log = log_path(state, f"r{state['round']}-designer.log")
+    cmd = [args.claude_bin, "-p", "--output-format", "json",
+           "--allowedTools",
+           "Read,Edit,Write,Glob,Grep,Agent,Bash(git diff:*),"
+           "Bash(git log:*),Bash(git show:*),Bash(git status:*)"]
+    if state.get("claude_session"):
+        cmd += ["--resume", state["claude_session"]]
+    if model:
+        cmd += ["--model", model]
+    fb = (args.claude_fallback_model or "").strip()
+    if fb and fb != model:
+        # CLI-level safety net for "overloaded or not available"; duet's own
+        # retry below is what handles quota exhaustion
+        cmd += ["--fallback-model", fb]
+    if args.claude_effort:
+        cmd += ["--effort", args.claude_effort]
+    cmd += [prompt]
+    try:
+        r = subprocess.run(cmd, cwd=state["repo"], capture_output=True,
+                           text=True,
+                           timeout=args.turn_timeout if args.turn_timeout > 0
+                           else None)
+    except subprocess.TimeoutExpired:
+        raise TurnError(f"claude turn exceeded {args.turn_timeout}s")
+    with log.open("a") as f:
+        f.write(f"--- model {model} exit {r.returncode} ---\n{r.stdout}\n"
+                f"--- stderr ---\n{r.stderr}\n")
+    blob = f"{r.stdout}\n{r.stderr}"
+    if r.returncode != 0:
+        return None, blob or f"claude -p failed, exit {r.returncode}"
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None, f"claude -p output was not JSON; log: {log}"
+    if data.get("is_error"):
+        return None, blob
+    if data.get("session_id"):
+        state["claude_session"] = data["session_id"]
+    served = sorted(data.get("modelUsage") or {})
+    if served and not model_served(model, served):
+        emit(f"[duet] designer turn was served by {', '.join(served)}, "
+             f"not the requested {model}")
+    return (data.get("result") or "").strip(), None
+
+
+def run_claude(state, args, prompt):
+    model = state.get("claude_model") or args.claude_model
+    fallback = (args.claude_fallback_model or "").strip()
+    for attempt in (1, 2):
+        entry, err = claude_once(state, args, prompt, model)
+        if err is None:
+            return entry
+        exhausted = bool(USAGE_LIMIT_RE.search(err))
+        if attempt == 1 and exhausted and fallback and fallback != model:
+            emit(f"[duet] {model} usage is exhausted — the designer "
+                 f"continues on {fallback} for the rest of this section")
+            state["claude_model"] = model = fallback  # sticky: don't re-hit it
+            continue
+        log = log_path(state, f"r{state['round']}-designer.log")
+        if exhausted:
+            raise TurnError(f"{model} usage is exhausted and no fallback is "
+                            f"available; log: {log}")
+        raise TurnError(f"claude -p failed; log: {log}")
+
+
+def build_prompt(role, state):
+    role_file = (SKILL_DIR / "prompts" / f"{role}.md").read_text()
+    other = "engineer" if role == "designer" else "designer"
+    last = state["last_entry"].get(other) or "(none yet — opening turn)"
+    opens = [f"  OPEN-{k} (raised by {v['raiser']}): {v['text']}"
+             for k, v in state["open_items"].items() if v["status"] == "open"]
+    frozen = ("FROZEN — new OPEN items need REGRESSION: + EVIDENCE:"
+              if state["round"] > state["freeze_round"]
+              else f"open until end of round {state['freeze_round']}")
+    contract = OUTPUT_CONTRACT.replace("{NEXT_ID}", str(state["next_open_id"]))
+    return f"""{role_file}
+
+=== SECTION STATE ===
+MISSION: {state['mission']}
+ROUND: {state['round']} of {state['rounds']} (scope {frozen})
+REPO: {state['repo']}
+WAR ROOM: .duet/DESIGN.md (designer-owned), .duet/CONTEXT.md (project &
+conversation brief — read it first if present), .duet/REVIEW.md (read-only
+to you; the relay appends your entry for you)
+OPEN ITEMS:
+{chr(10).join(opens) if opens else '  none'}
+LATEST {other.upper()} ENTRY:
+{last}
+
+{contract}"""
+
+
+def take_turn(role, state, args):
+    runner = run_claude if role == "designer" else run_codex
+    if role == "designer":
+        emit(f"\n[claude is reviewing — round {state['round']}…]")
+    else:
+        emit(f"\n[codex engineering — round {state['round']}…]")
+    entry = runner(state, args, build_prompt(role, state))
+    errs = validate_entry(entry, role, state)
+    if errs:
+        emit(f"[relay] bounced {role} entry: " + "; ".join(errs))
+        fix = ("Your entry was rejected by the relay:\n- "
+               + "\n- ".join(errs)
+               + "\n\nResubmit the corrected entry only. Do not discuss the "
+                 "rejection, do not apologize, do not add anything else.")
+        entry = runner(state, args, fix)
+        errs = validate_entry(entry, role, state)
+        if errs:
+            raise TurnError(f"{role} produced a non-conformant entry twice: "
+                            + "; ".join(errs))
+    return entry
+
+
+# ---------------- privacy wipe ----------------
+
+WIPE_KEEP = {"auth.json", "config.toml", "installation_id",
+             "models_cache.json", "version.json"}
+
+
+def wipe_codex_home(verbose=True):
+    # Allowlist, not blocklist: codex 0.144+ also writes memories_*.sqlite,
+    # logs_*.sqlite, goals_*.sqlite, shell_snapshots, … — all of which can
+    # carry conversation-derived content across sections.
+    if CODEX_HOME.resolve() == REAL_CODEX_HOME.resolve():
+        die("refusing to wipe ~/.codex — duet must use its own CODEX_HOME")
+    removed = []
+    if CODEX_HOME.is_dir():
+        for target in CODEX_HOME.iterdir():
+            if target.name in WIPE_KEEP:
+                continue
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            removed.append(target.name)
+    if verbose:
+        print(f"[duet] codex home wiped ({', '.join(sorted(removed)) or 'already clean'}); "
+              "auth and config kept")
+
+
+def other_duet_codex_running(current_section):
+    """True if a codex process from a *different* duet section is alive."""
+    try:
+        out = subprocess.run(["pgrep", "-fl", "codex exec"],
+                             capture_output=True, text=True).stdout
+    except Exception:
+        return True  # can't tell — be conservative, defer the global wipe
+    marker = str(DUET_HOME / "logs") + "/"
+    return any(marker in line and marker + current_section + "/" not in line
+               for line in out.splitlines())
+
+
+def wipe_for_section(section, session_id):
+    """Surgical wipe: this section's session only; full sweep when idle.
+
+    Automatic wipes must not clobber concurrent sections (a `duet review`
+    once deleted an in-flight section's rollout mid-run). The full allowlist
+    sweep still happens whenever no other duet codex is active, so the
+    memories/logs sqlite files never outlive the last running section.
+    """
+    n = 0
+    root = CODEX_HOME / "sessions"
+    if session_id and root.is_dir():
+        for p in root.rglob(f"rollout-*{session_id}*.jsonl"):
+            p.unlink()
+            n += 1
+    if other_duet_codex_running(section):
+        emit(f"[duet] wiped this section's codex session ({n} file(s)); "
+             "another duet section is running — global sweep deferred "
+             "(it runs automatically when that section ends, or: duet wipe)")
+    else:
+        wipe_codex_home()
+
+
+def finalize(state, outcome, no_wipe=False):
+    d = duet_dir(state)
+    sid = state["section"]
+    items = [f"- OPEN-{k} ({v['raiser']}, {v['status']}): {v['text']}"
+             for k, v in state["open_items"].items()] or ["- none"]
+    (d / "sections" / f"{sid}.md").write_text(
+        f"# {sid}\n\nMISSION: {state['mission']}\nOUTCOME: {outcome}\n"
+        f"ROUNDS USED: {state['round']}\n\n## Items\n" + "\n".join(items)
+        + f"\n\nFull transcript: REVIEW.md, section {sid}.\n")
+    codex_sid = state.get("codex_session")
+    state["codex_session"] = None
+    if outcome.startswith("BLOCKED"):
+        save_state(state)  # keep for `duet run --continue`
+    else:
+        save_state(state)
+        (d / "state.json").rename(d / "sections" / f"{sid}-state.json")
+    if not no_wipe:
+        wipe_for_section(sid, codex_sid)
+    print(f"[duet] OUTCOME: {outcome}  (summary: {d / 'sections' / (sid + '.md')})")
+
+
+# ---------------- live dialogue feed ----------------
+# Everything duet prints also lands in a per-section live.txt, so the user
+# can follow the Fable⇄Codex exchange in any VSCode terminal via
+# `duet stream` — no file-opening, no REVIEW.md staring.
+
+LIVE_FH = None
+
+
+def live_open(state):
+    global LIVE_FH
+    p = DUET_HOME / "logs" / state["section"] / "live.txt"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    LIVE_FH = p.open("a")
+    return p
+
+
+def emit(text=""):
+    # stdout may be a pipe that the reader closed (e.g. `duet ... | head`);
+    # never let that kill the relay mid-turn — degrade to file-only.
+    try:
+        print(text, flush=True)
+    except (BrokenPipeError, OSError):
+        pass
+    if LIVE_FH:
+        LIVE_FH.write(text + "\n")
+        LIVE_FH.flush()
+
+
+def emit_block(title, body):
+    emit()
+    emit(f"──── {title} " + "─" * max(4, 62 - len(title)))
+    emit(body.strip())
+    emit("─" * 68)
+
+
+def follow_file(path, from_start=False, transform=None):
+    print(f"[duet] following {path} (Ctrl-C to stop)")
+    pos = 0 if from_start else (path.stat().st_size if path.exists() else 0)
+    try:
+        while True:
+            if path.exists():
+                size = path.stat().st_size
+                if size < pos:
+                    pos = 0
+                if size > pos:
+                    with path.open() as f:
+                        f.seek(pos)
+                        chunk = f.read()
+                    pos = size
+                    sys.stdout.write(transform(chunk) if transform else chunk)
+                    sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[duet] stopped")
+
+
+def review_path(repo):
+    return Path(repo).resolve() / ".duet" / "REVIEW.md"
+
+
+def colorize(chunk):
+    if not sys.stdout.isatty():
+        return chunk
+    chunk = re.sub(r"^(## R\d+ · DESIGNER.*)$", "\033[1;36m\\1\033[0m",
+                   chunk, flags=re.M)
+    chunk = re.sub(r"^(## R\d+ · ENGINEER.*)$", "\033[1;35m\\1\033[0m",
+                   chunk, flags=re.M)
+    chunk = re.sub(r"^(VERDICT: SHIP)$", "\033[1;32m\\1\033[0m",
+                   chunk, flags=re.M)
+    chunk = re.sub(r"^(VERDICT: BLOCKED.*)$", "\033[1;31m\\1\033[0m",
+                   chunk, flags=re.M)
+    return chunk
+
+
+def cmd_watch(args):
+    follow_file(review_path(args.repo), from_start=args.all,
+                transform=colorize)
+
+
+def cmd_stream(args):
+    state = load_state(args.repo)
+    follow_file(DUET_HOME / "logs" / state["section"] / "live.txt",
+                from_start=args.all)
+
+
+# ---------------- subcommands ----------------
+
+def cmd_run(args):
+    repo = Path(args.repo).resolve()
+    if args.cont:
+        state = load_state(repo)
+        state["rounds"] = args.rounds
+        print(f"[duet] continuing {state['section']} at round {state['round']} "
+              "(codex cold-starts from war-room files)")
+    else:
+        if not args.mission:
+            die("--mission is required for a new section")
+        state = fresh_state(args, repo)
+        save_state(state)
+        print(f"[duet] section {state['section']} started: {state['mission']}")
+    lease = acquire_driver_lease(state["section"])
+    live = live_open(state)
+    emit(f"[duet] live dialogue feed: {live}\n"
+         f"[duet] follow it in a VSCode terminal: duet stream --repo {repo}")
+    outcome = None
+    try:
+        while state["round"] <= state["rounds"]:
+            for role in ("designer", "engineer"):
+                entry = take_turn(role, state, args)
+                verdict = apply_entry(entry, role, state)
+                append_entry(state, role, entry)
+                save_state(state)
+                if role == "designer":
+                    emit_block(f"CLAUDE → CODEX · R{state['round']}", entry)
+                emit(f"[duet] R{state['round']} · {role}: {verdict}")
+                if verdict.startswith("BLOCKED"):
+                    outcome = verdict
+                    break
+            if outcome:
+                break
+            if dual_ship(state):
+                outcome = "SHIP"
+                break
+            state["round"] += 1
+        else:
+            outcome = "ROUND-CAP (no convergence; review REVIEW.md, then "\
+                      "`duet run --continue` or `duet end`)"
+    except TurnError as e:
+        outcome = f"BLOCKED: {e}"
+    except KeyboardInterrupt:
+        outcome = "BLOCKED: interrupted by user"
+    finally:
+        finalize(state, outcome or "BLOCKED: aborted", no_wipe=args.no_wipe)
+        release_driver_lease(lease)
+
+
+def cmd_start(args):
+    repo = Path(args.repo).resolve()
+    if not args.mission:
+        die("--mission is required")
+    state = fresh_state(args, repo)
+    save_state(state)
+    live = live_open(state)
+    print(f"[duet] section {state['section']} started in {repo}\n"
+          f"live feed: {live} (follow: duet stream --repo {repo})\n"
+          f"next: write .duet/DESIGN.md, then `duet note --file <entry>` "
+          f"and `duet turn`")
+
+
+def enforce_round_cap(state):
+    """Conversation cap: interactive sections stop at the same round cap as
+    headless runs. Time per turn is unbounded; the number of exchanges is not."""
+    if state["round"] > state["rounds"]:
+        die(f"conversation cap reached ({state['rounds']} rounds used) — "
+            "no further claude⇄codex exchanges in this section. Close with "
+            "`duet end`, or (human decision) raise \"rounds\" in "
+            ".duet/state.json and retry.")
+
+
+def cmd_note(args):
+    state = load_state(args.repo)
+    enforce_round_cap(state)
+    text = Path(args.file).read_text().strip() if args.file else args.text
+    if not text:
+        die("provide --file or --text")
+    errs = validate_entry(text, "designer", state)
+    if errs:
+        print("[duet] entry rejected:\n- " + "\n- ".join(errs), file=sys.stderr)
+        sys.exit(2)
+    live_open(state)
+    verdict = apply_entry(text, "designer", state)
+    append_entry(state, "designer", text)
+    save_state(state)
+    emit_block(f"CLAUDE → CODEX · R{state['round']}", text)
+    emit(f"[duet] R{state['round']} · designer: {verdict}")
+
+
+def cmd_turn(args):
+    state = load_state(args.repo)
+    enforce_round_cap(state)
+    if "designer" not in state["last_entry"]:
+        die("designer goes first: record your entry with `duet note`")
+    lease = acquire_driver_lease(state["section"])
+    live_open(state)
+    try:
+        entry = take_turn("engineer", state, args)
+    except TurnError as e:
+        die(str(e))
+    verdict = apply_entry(entry, "engineer", state)
+    append_entry(state, "engineer", entry)
+    emit(f"[duet] R{state['round']} · engineer: {verdict}")
+    if dual_ship(state):
+        print("[duet] dual SHIP with no open items — run `duet end`")
+    elif verdict.startswith("BLOCKED"):
+        print("[duet] engineer is BLOCKED — human decision needed")
+    state["round"] += 1
+    save_state(state)
+    if state["round"] > state["rounds"]:
+        print(f"[duet] conversation cap reached ({state['rounds']} rounds) — "
+              "next step is `duet end` (or a human-approved rounds bump in "
+              ".duet/state.json)")
+    release_driver_lease(lease)
+
+
+def cmd_end(args):
+    state = load_state(args.repo)
+    outcome = "SHIP" if dual_ship(state) else "ENDED (no dual SHIP)"
+    finalize(state, outcome, no_wipe=args.no_wipe)
+
+
+def cmd_review(args):
+    """One-shot adversarial review (inspired by openai/codex-plugin-cc's
+    /codex:adversarial-review, rebuilt on duet's privacy model: isolated
+    CODEX_HOME, read-only sandbox, session wiped afterward)."""
+    repo = Path(args.repo).resolve()
+    sid = datetime.now().strftime("rev%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    state = {"section": sid,
+             "round": 1, "repo": str(repo), "mission": "adversarial review",
+             "open_items": {}, "next_open_id": 1, "last_entry": {},
+             "last_verdict": {}, "rounds": 1, "freeze_round": 1,
+             "codex_session": None}
+    lease = acquire_driver_lease(sid)
+    live_open(state)
+    # reviews keep no state.json, so progress must be pinned by section id
+    emit(f"[duet] review section {sid} — step monitor: "
+         f"duet progress --follow --section {sid}")
+    role = (SKILL_DIR / "prompts" / "engineer.md").read_text()
+    prompt = f"""{role}
+
+=== ONE-SHOT ADVERSARIAL REVIEW (read-only) ===
+Repo: {repo}
+Focus: {args.focus or 'the latest diff if this is a git repo, else the code as it stands'}
+You cannot edit files. Hunt for defects that change behavior, correctness,
+cost, or security. Steelman the existing design before condemning it; cite
+file:line for every claim; no filler, no praise. Final message: conclusion
+first, then each finding with its evidence. Last line:
+VERDICT: SHIP (clean) or VERDICT: CONTINUE (issues found)."""
+    args.codex_sandbox = "read-only"
+    try:
+        run_codex(state, args, prompt)
+    finally:
+        wipe_for_section(state["section"], state.get("codex_session"))
+        release_driver_lease(lease)
+
+
+def cmd_wipe(args):
+    wipe_codex_home()
+
+
+def codex_login_command():
+    return f"CODEX_HOME={shlex.quote(str(CODEX_HOME))} codex login"
+
+
+def auth_status():
+    if (CODEX_HOME / "auth.json").exists():
+        return "ready"
+    if (REAL_CODEX_HOME / "auth.json").exists():
+        return "NO AUTH — run duet init"
+    return f"NO AUTH — run: {codex_login_command()}"
+
+
+def cmd_status(args):
+    print(f"DUET_HOME:  {DUET_HOME}")
+    print(f"CODEX_HOME: {CODEX_HOME} ({auth_status()})")
+    sessions = list((CODEX_HOME / "sessions").rglob("rollout-*.jsonl")) \
+        if (CODEX_HOME / "sessions").is_dir() else []
+    print(f"codex sessions awaiting wipe: {len(sessions)}")
+    sp = Path(args.repo).resolve() / ".duet" / "state.json"
+    if sp.exists():
+        s = json.loads(sp.read_text())
+        print(f"section {s['section']} round {s['round']}/{s['rounds']} — "
+              f"mission: {s['mission']}")
+        for k, v in s["open_items"].items():
+            if v["status"] == "open":
+                print(f"  OPEN-{k} ({v['raiser']}): {v['text']}")
+    else:
+        print("no section in flight in this repo")
+
+
+def find_progress_dir(repo, section=""):
+    """Log directory holding this section's progress files (None if unknown)."""
+    if section:
+        d = DUET_HOME / "logs" / section
+        return d if d.is_dir() else None
+    try:  # state.json can be rewritten/moved mid-read (finalize) — retry ok
+        sp = Path(repo).resolve() / ".duet" / "state.json"
+        if sp.exists():
+            # pinned to this repo's section — never fall back globally, or a
+            # concurrent session's newer file would leak in (the progress
+            # files may simply not exist yet before the first engineer turn)
+            d = DUET_HOME / "logs" / json.loads(sp.read_text())["section"]
+            return d if d.is_dir() else None
+    except (OSError, json.JSONDecodeError, KeyError):
+        return None
+    # no section in this repo (e.g. `duet review`) — newest section wins
+    logs = DUET_HOME / "logs"
+    cands = sorted(logs.glob("*/progress.json"),
+                   key=lambda q: q.stat().st_mtime) if logs.is_dir() else []
+    return cands[-1].parent if cands else None
+
+
+def progress_line(d, age_s=None):
+    rnd = d.get("round", "?")
+    tail = f", {age_s}" if age_s else ""
+    if d.get("status") == "turn-complete":
+        return f"codex finished its round-{rnd} turn" \
+               + (f" ({age_s})" if age_s else "")
+    if d.get("status") == "turn-failed":
+        return f"codex turn failed (round {rnd}{tail}) — see duet logs"
+    step, total = d.get("step"), d.get("total")
+    if step and total:
+        return f"codex is on step {step}/{total} (round {rnd}{tail})"
+    return f"codex is thinking — no step counter yet (round {rnd}{tail})"
+
+
+def progress_records(path, pos):
+    """Read whole appended records from byte `pos`; (records, new_pos)."""
+    recs = []
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return recs, pos
+    if size < pos:  # truncated/rotated under us
+        pos = 0
+    if size == pos:
+        return recs, pos
+    try:
+        with path.open("rb") as f:
+            f.seek(pos)
+            buf = f.read(size - pos)
+    except OSError:
+        return recs, pos
+    if not buf.endswith(b"\n"):  # a record still being written — leave it
+        cut = buf.rfind(b"\n")
+        if cut == -1:
+            return recs, pos
+        buf, size = buf[:cut + 1], pos + cut + 1
+    for line in buf.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            recs.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return recs, size
+
+
+def prime_records(recs, cutoff):
+    """What to print on the follower's first pass: the turn currently in
+    flight, in full — the monitor is armed just after the turn is launched in
+    the background, so the opening records are usually already on disk, and
+    an earlier round's history must not be replayed on top of them."""
+    start = None
+    for i, r in enumerate(recs):
+        if r.get("status") == "thinking":
+            start = i  # a turn began here
+        elif r.get("status") in ("turn-complete", "turn-failed"):
+            start = None  # …and ended: nothing in flight
+    if start is not None:
+        return recs[start:]
+    return [r for r in recs if rec_epoch(r) >= cutoff]
+
+
+def rec_epoch(rec):
+    try:
+        return datetime.strptime(rec.get("updated") or "", "%Y-%m-%dT%H:%M:%SZ") \
+            .replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def pid_alive(pid):
+    """True/False for a legacy driver pid, None when it cannot be inspected.
+
+    os.kill(pid, 0) alone is not enough: an exited driver that its parent
+    shell has not reaped yet is a zombie, and a zombie still accepts signal
+    0. Lease-aware sections do not use this path; `ps` settles zombies and pid
+    reuse for older sections, with unknown results bounded by follow_progress."""
+    if not pid:
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (TypeError, ValueError, OverflowError):
+        return None
+    except PermissionError:
+        pass  # the pid exists, but ps still has to distinguish zombie/reuse
+    try:
+        r = subprocess.run(["ps", "-ww", "-o", "state=,command=",
+                            "-p", str(pid)], capture_output=True, text=True)
+    except Exception:
+        return None
+    out = r.stdout.strip()
+    if r.returncode == 1 and not out:
+        return False
+    if r.returncode != 0 or not out:
+        return None
+    state, _, command = out.partition(" ")
+    if state.startswith("Z"):
+        return False  # exited, awaiting reaping
+    return "duet" in command
+
+
+def duet_driver_running():
+    """Legacy global sweep: True/False, or None when pgrep is unavailable."""
+    try:
+        r = subprocess.run(["pgrep", "-fl", "bin/duet"],
+                           capture_output=True, text=True)
+    except Exception:
+        return None
+    if r.returncode == 1:
+        return False
+    if r.returncode != 0:
+        return None
+    return any(re.search(r"bin/duet\s+(run|turn|review)\b", line)
+               for line in r.stdout.splitlines())
+
+
+def read_progress(repo, section=""):
+    d = find_progress_dir(repo, section)
+    if not d:
+        return None
+    try:
+        return json.loads((d / "progress.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def follow_progress(args):
+    """Tail the append-only transition log, so every step is delivered even
+    when several land between two polls."""
+    # floored: records are stamped to whole seconds, so a fractional cutoff
+    # would reject a record written *after* startup whose stamp floors below it
+    cutoff = float(int(time.time() - max(0, args.replay)))
+    started = time.monotonic()
+    path, pos, primed, seen_driver, pid = None, 0, False, False, None
+    follow_dir = None
+    unknown_since = None
+    snap_prev = None
+    shown = None
+
+    def drain():
+        nonlocal pos, pid
+        recs, pos = progress_records(path, pos)
+        for r in recs:
+            pid = r.get("driver_pid") or pid
+        return recs
+
+    def show(recs):
+        """Print each transition once. Records that render to the line we
+        just printed are dropped: a log written by an older driver carries
+        heartbeat records that now render as the step they belonged to, and
+        relaying 'Codex is on step 5 of 5' twice tells the human nothing."""
+        nonlocal shown
+        for r in recs:
+            line = progress_line(r)
+            if line == shown:
+                continue
+            shown = line
+            print(line, flush=True)
+
+    while True:
+        activity = False
+        if pid is None:  # not seen in a record yet — try the snapshot
+            pid = (read_progress(args.repo, args.section) or {}).get("driver_pid")
+        if follow_dir is None:
+            follow_dir = find_progress_dir(args.repo, args.section)
+        d = follow_dir  # pin one section; never drift to a concurrent newer log
+        alive = driver_lease_alive(d.name) if d is not None else None
+        if alive is None:  # legacy section: process inspection, when available
+            alive = pid_alive(pid)
+            if alive is None:
+                alive = duet_driver_running()
+        if alive is True:
+            seen_driver = True
+        if path is None or not path.exists():
+            cand = (d / "progress.jsonl") if d else None
+            if cand is not None and cand.exists():
+                path = cand
+                if snap_prev is None:
+                    pos = 0
+                else:
+                    # we have been reporting from the snapshot, which already
+                    # reflects every record written so far; replaying the log
+                    # from byte zero would re-print the step we just sent
+                    try:
+                        pos = cand.stat().st_size
+                    except OSError:
+                        pos = 0
+                    primed = True
+        if path is not None:
+            recs = drain()
+            activity = bool(recs)
+            if not primed:  # first pass: don't replay an earlier round
+                primed = True
+                recs = prime_records(recs, cutoff)
+            show(recs)
+        else:
+            # no transition log: a turn that was already in flight when this
+            # was installed. Sample the snapshot, as the old follower did —
+            # lossy, but better than staying silent until the turn ends.
+            snap = read_progress(args.repo, args.section)
+            if snap:
+                line = progress_line(snap)
+                if snap_prev is None and \
+                        snap.get("status") in ("turn-complete", "turn-failed"):
+                    snap_prev = line  # stale pre-existing state; don't replay
+                if line != snap_prev:
+                    print(line, flush=True)
+                    snap_prev = shown = line
+                    activity = True
+        now = time.monotonic()
+        if alive is None:
+            # No lease means an older section. Extend its finite grace when
+            # progress arrives, but never turn an uninspectable pid into an
+            # infinite wait.
+            if unknown_since is None or activity:
+                unknown_since = now
+        else:
+            unknown_since = None
+        dead = alive is False and (seen_driver or now - started >= args.startup)
+        unknown_expired = alive is None and unknown_since is not None \
+            and now - unknown_since >= args.startup
+        if dead or unknown_expired:
+            if path is not None:  # final drain: written just before exit
+                show(drain())
+            print("[duet] follow ended — no duet turn in flight", flush=True)
+            return
+        time.sleep(2)
+
+
+def cmd_progress(args):
+    """Step progress in plain lines — numbers only, never thoughts.
+
+    This is plumbing for the live Claude session, not a user-facing view:
+    Claude arms `--follow` as a background monitor and relays each printed
+    line to the user as a normal chat message ("Codex is on step 3 of 7").
+    `--follow` prints one line per transition — tailed from an append-only
+    log, so a burst of steps is delivered in full rather than sampled — and
+    exits when no duet driver (run/turn/review) is left running. `--section`
+    pins to one section's progress (required to follow a `duet review`, which
+    keeps no state.json; the review prints its section id at launch)."""
+    if args.follow:
+        return follow_progress(args)
+    d = read_progress(args.repo, args.section)
+    if not d:
+        print("no codex turn recorded yet")
+        return
+    try:
+        ts = datetime.strptime(d.get("updated", ""),
+                               "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        age = int((datetime.now(timezone.utc) - ts).total_seconds())
+        age_s = f"{age}s ago" if age < 120 else f"{age // 60}m ago"
+    except ValueError:
+        age_s = "age unknown"
+    print(progress_line(d, age_s))
+
+
+def cmd_init(args):
+    CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    (DUET_HOME / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = CODEX_HOME / "config.toml"
+    if not cfg.exists():
+        model = "gpt-5.6-sol"
+        real_cfg = REAL_CODEX_HOME / "config.toml"
+        if real_cfg.exists():
+            m = re.search(r'^model\s*=\s*"([^"]+)"', real_cfg.read_text(), re.M)
+            if m:
+                model = m.group(1)
+        cfg.write_text(
+            f'# duet-managed Codex home — isolated from ~/.codex.\n'
+            f'model = "{model}"\n'
+            f'model_reasoning_effort = "ultra"\n'
+            f'model_verbosity = "low"\n'
+            f'model_reasoning_summary = "detailed"\n\n'
+            f'[history]\npersistence = "none"\n')
+        print(f"[duet] wrote {cfg} (model={model})")
+    auth_src = REAL_CODEX_HOME / "auth.json"
+    auth_dst = CODEX_HOME / "auth.json"
+    if auth_src.exists() and (args.refresh_auth or not auth_dst.exists()):
+        shutil.copy2(auth_src, auth_dst)
+        auth_dst.chmod(0o600)
+        print("[duet] auth copied from ~/.codex (re-run `duet init "
+              "--refresh-auth` if it ever expires)")
+    elif not auth_dst.exists():
+        print(f"[duet] no auth found — run: {codex_login_command()}")
+    for tool in ("codex", "claude"):
+        if not shutil.which(tool):
+            print(f"[duet] WARNING: `{tool}` not on PATH")
+    print("[duet] init complete")
+
+
+def add_common(p):
+    p.add_argument("--repo", default=".")
+    p.add_argument("--codex-bin", default=os.environ.get("DUET_CODEX_BIN", "codex"))
+    p.add_argument("--claude-bin", default=os.environ.get("DUET_CLAUDE_BIN", "claude"))
+    p.add_argument("--codex-model", default=os.environ.get("DUET_CODEX_MODEL", ""))
+    # the designer should be the model the human is actually talking to — the
+    # skill passes the live session's model explicitly; this default is what
+    # applies when it can't. DUET_CLAUDE_MODEL overrides both.
+    p.add_argument("--claude-model",
+                   default=os.environ.get("DUET_CLAUDE_MODEL", "fable"))
+    p.add_argument("--claude-fallback-model",
+                   default=os.environ.get("DUET_CLAUDE_FALLBACK_MODEL",
+                                          "opus"),
+                   help="model the designer continues on when the primary's "
+                        "usage is exhausted (empty to disable and fail "
+                        "instead)")
+    p.add_argument("--claude-effort",
+                   default=os.environ.get("DUET_CLAUDE_EFFORT", "max"))
+    p.add_argument("--codex-sandbox",
+                   default=os.environ.get("DUET_CODEX_SANDBOX", "workspace-write"))
+    p.add_argument("--codex-net", action="store_true",
+                   help="allow network inside codex sandbox")
+    p.add_argument("--turn-timeout", type=int,
+                   default=int(os.environ.get("DUET_TURN_TIMEOUT", "0")),
+                   help="seconds per model turn; 0 = no time cap (default). "
+                        "Pacing is bounded by the section round cap instead.")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="duet")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="create ~/.duet codex home + copy auth")
+    p.add_argument("--refresh-auth", action="store_true")
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("run", help="autonomous section: both sides headless")
+    add_common(p)
+    p.add_argument("--mission", default="")
+    p.add_argument("--rounds", type=int, default=8)
+    p.add_argument("--freeze", type=int, default=3)
+    p.add_argument("--continue", dest="cont", action="store_true")
+    p.add_argument("--no-wipe", action="store_true")
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("start", help="open a section (interactive mode)")
+    add_common(p)
+    p.add_argument("--mission", default="")
+    p.add_argument("--rounds", type=int, default=8)
+    p.add_argument("--freeze", type=int, default=3)
+    p.set_defaults(fn=cmd_start)
+
+    p = sub.add_parser("note", help="record the live designer's entry")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--file", default="")
+    p.add_argument("--text", default="")
+    p.set_defaults(fn=cmd_note)
+
+    p = sub.add_parser("turn", help="run one engineer (codex) turn")
+    add_common(p)
+    p.set_defaults(fn=cmd_turn)
+
+    p = sub.add_parser("review", help="one-shot adversarial codex review "
+                       "(read-only, auto-wiped)")
+    add_common(p)
+    p.add_argument("--focus", default="")
+    p.set_defaults(fn=cmd_review)
+
+    p = sub.add_parser("end", help="close section: summary + privacy wipe")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--no-wipe", action="store_true")
+    p.set_defaults(fn=cmd_end)
+
+    p = sub.add_parser("wipe", help="wipe duet codex sessions/history now")
+    p.set_defaults(fn=cmd_wipe)
+
+    p = sub.add_parser("status", help="show duet + section state")
+    p.add_argument("--repo", default=".")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("watch", help="follow the REVIEW.md entry ledger")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--all", action="store_true",
+                   help="print the whole transcript, then follow")
+    p.set_defaults(fn=cmd_watch)
+
+    p = sub.add_parser("stream", help="follow the live dialogue feed "
+                       "(forwarded prompts, codex commands/edits, replies)")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--all", action="store_true",
+                   help="replay the whole feed, then follow")
+    p.set_defaults(fn=cmd_stream)
+
+    p = sub.add_parser("progress", help="codex step progress, numbers only "
+                       "(plumbing for the live Claude session — not a user "
+                       "command)")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--follow", action="store_true",
+                   help="print one line per transition, exit when no duet "
+                        "driver is running (Claude's background monitor)")
+    p.add_argument("--section", default="",
+                   help="pin to one section id (required for `duet review`, "
+                        "which keeps no state.json)")
+    p.add_argument("--replay", type=float, default=20.0, metavar="SECONDS",
+                   help="on start, when no turn is in flight, replay "
+                        "transitions from the last N seconds (an in-flight "
+                        "turn is always replayed in full); 0 = only what "
+                        "arrives from now on")
+    p.add_argument("--startup", type=float, default=25.0, metavar="SECONDS",
+                   help="grace before giving up when no driver appears or "
+                        "legacy driver liveness cannot be inspected")
+    p.set_defaults(fn=cmd_progress)
+
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
