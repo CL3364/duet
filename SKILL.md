@@ -1,6 +1,8 @@
 ---
 name: duet
-description: Claude(designer) ⇄ Codex(engineer) peer review loop — this session's model and gpt-5.6-sol argue to common ground over an evidence-gated relay, with automatic privacy wipe for shared ChatGPT accounts. Use when asked to "duet", "pair with codex", "bridge to codex/gpt", or run a design⇄engineering loop with GPT.
+description: Pairs your Claude Code session with OpenAI's Codex CLI as design and engineering peers that argue to common ground on evidence, then reports what they settled and what deadlocked. Use when the user says "duet", asks to pair with or bridge to Codex/GPT, wants a second AI model to adversarially review a design, plan, or diff ("have GPT check this", "get a second opinion on this migration"), or wants two models argued to consensus instead of one model's answer. Codex runs in an isolated home that is wiped after each section. Not for ordinary single-model coding, and not when the work should stay resumable in your Codex history.
+license: MIT
+compatibility: Requires Claude Code with the `claude` CLI on PATH, the OpenAI Codex CLI (version 0.144 or newer) signed into an OpenAI account, Python 3.9+, and macOS or Linux. Needs no network access of its own; both models bill to the user's own subscriptions.
 allowed-tools:
   - Bash
   - Read
@@ -10,6 +12,11 @@ allowed-tools:
   - Grep
   - Agent
   - AskUserQuestion
+metadata:
+  author: CL3364
+  version: 1.0.0
+  homepage: https://github.com/CL3364/duet
+  tags: [code-review, multi-agent, codex, adversarial-review]
 ---
 
 # duet — Claude designs, Codex engineers
@@ -242,44 +249,21 @@ solo account.
   to stay resumable in your Codex history afterwards, talk to Codex directly
   instead.
 
-## Troubleshooting
+## When something fails
 
-- `codex exec` exit 137 (SIGKILL): known when nested inside another sandbox.
-  Run duet from a plain terminal or set
-  `DUET_CODEX_SANDBOX=danger-full-access` (only when already externally
-  sandboxed).
-- Auth expired in duet home: `duet init --refresh-auth` (re-copies from
-  ~/.codex after the user logs in there).
-- Model knobs: `DUET_CODEX_MODEL` (default: duet config, gpt-5.6-sol),
-  `DUET_CLAUDE_MODEL` (default: fable — but pass `--claude-model` with the
-  live session's model instead), `DUET_CLAUDE_FALLBACK_MODEL` (default:
-  opus, on quota exhaustion only; see "Which model the designer runs").
-  Entry length has no hard cap — it is
-  steered by the output contract plus `model_verbosity = "low"` in the duet
-  codex config (see PROTOCOL.md research notes).
-- Engineer needs npm/pip: pass `--codex-net`.
-- Turn time vs conversation budget: model turns have **no time cap by
-  default** (`--turn-timeout 0`; set seconds explicitly or `DUET_TURN_TIMEOUT`
-  to restore one). Runaway dialogue is bounded by the **round cap instead**,
-  now enforced in interactive mode too: `note`/`turn` refuse once the
-  section's `rounds` budget (default 8) is used; only a human may raise it
-  (edit `rounds` in `.duet/state.json`).
-- Codex thinking is intentionally invisible: reasoning text is dropped by
-  the relay everywhere (stream, feed file, debug logs). Step numbers,
-  relayed by Claude as chat messages from the `duet progress --follow`
-  monitor, are the only window into a turn in flight.
-  `model_reasoning_summary = "detailed"` stays in the duet codex config
-  solely to make those step markers available; effort stays `ultra`.
-- No step counter for a whole turn: Codex skipped its plan tool despite
-  `prompts/engineer.md` requiring it — the counter has no other honest
-  source, so the relay stays quiet rather than padding the feed. Per-section
-  transitions are kept in `~/.duet/logs/<section>/progress.jsonl` (the
-  append-only log the follower tails) alongside `progress.json` (the
-  snapshot the one-shot form reads); check the log when a step looks
-  missing — if it isn't there, Codex never reported it.
-- A monitor that never exits: current drivers hold a section-scoped kernel
-  lease, released automatically even on crashes, so a concurrent duet section
-  neither holds this follower open nor ends it early. Legacy sections fall
-  back to pid inspection with a finite grace when process inspection is
-  unavailable. `--replay <s>` controls startup history (default 20s), and
-  `--startup <s>` controls the missing/unknown-driver grace.
+Read `docs/TROUBLESHOOTING.md` in this directory — it covers exit 137, expired
+auth, stale sessions, relay bounces, quota exhaustion, missing step counters,
+sandbox/network limits, model knobs and turn timeouts, each with the command
+that fixes it. Do not guess at a fix or invent a workaround before reading it.
+
+Two failure modes are worth knowing without opening the file, because they look
+like bugs and are not:
+
+- **No step counter for a whole turn.** Codex skipped its plan tool despite
+  `prompts/engineer.md` requiring one. The counter has no other honest source,
+  so the relay stays quiet rather than padding the feed. Say so once and do not
+  invent progress.
+- **A bounced entry auto-retries once.** Treat the retry's content as
+  authoritative; the bounced draft never reaches REVIEW.md. If a turn fails
+  after two bounces, the code changes are still on disk — read the diff before
+  continuing.

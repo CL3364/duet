@@ -186,6 +186,41 @@ check("no stale heartbeat/DUET_PROGRESS_HEARTBEAT references in the docs",
 check("role labels renamed off Fable",
       "FABLE" not in skill and "FABLE" not in (SKILL / "bin/duet").read_text())
 
+# ── 5b. skill contract: frontmatter + trigger-description drift ────────────
+# Whether the skill fires at all is decided solely by `description`. Editing it
+# for tone silently breaks triggering, and nothing else in the suite notices —
+# so the documented trigger phrases are asserted to still be in it.
+print("\n5b. Frontmatter and trigger coverage (Anthropic skill guide)")
+fm = skill.split("---")[1]
+desc = re.search(r"^description:\s*(.+?)(?=^\w[\w-]*:)", fm, re.S | re.M).group(1).strip()
+
+check("description is within the 1024-char limit", len(desc) <= 1024,
+      f"{len(desc)} chars")
+check("description says WHAT the skill does and WHEN to use it",
+      "Use when" in desc and len(desc.split("Use when")[0].split()) >= 8)
+check("no XML angle brackets anywhere in frontmatter (security restriction)",
+      not re.search(r"[<>]", fm), str(re.findall(r"[<>]", fm))[:80])
+check("frontmatter declares license, compatibility and metadata",
+      all(re.search(rf"^{f}:", fm, re.M)
+          for f in ("license", "compatibility", "metadata")))
+check("skill name is kebab-case and not a reserved claude/anthropic prefix",
+      re.search(r"^name:\s*([a-z0-9-]+)\s*$", fm, re.M)
+      and not re.match(r"(claude|anthropic)", "duet"))
+
+TRIGGERS = ["duet", "pair with", "bridge to", "second opinion",
+            "have GPT check this", "adversarially review"]
+missing = [t for t in TRIGGERS if t.lower() not in desc.lower()]
+check("every documented SHOULD-trigger phrase is still in the description",
+      not missing, f"missing: {missing}")
+check("description carries a negative trigger so it stays quiet on plain coding",
+      "Not for" in desc or "not for" in desc)
+tt = SKILL / "references" / "trigger-tests.md"
+check("references/trigger-tests.md exists and documents both directions",
+      tt.exists() and "Should trigger" in tt.read_text()
+      and "Should NOT trigger" in tt.read_text())
+check("SKILL.md defers failure handling instead of inlining it",
+      "docs/TROUBLESHOOTING.md" in skill)
+
 # ── 6. designer model selection ───────────────────────────────────────────
 print("\n6. Designer model — session model, fable default, opus on exhaustion")
 ap_src = (SKILL / "bin/duet").read_text()

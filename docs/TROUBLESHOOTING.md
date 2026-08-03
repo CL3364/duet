@@ -92,6 +92,38 @@ finish it" brief rather than restarting the round.
 duet already passes `stdin=DEVNULL` to prevent this. If you see it, you're
 invoking `codex` directly somewhere, not through the relay.
 
+### Codex can't reach npm / pip / the network
+
+Its sandbox is `workspace-write` with no network by default. Pass `--codex-net`
+to open network access inside the sandbox when it genuinely needs to install
+something. Leave it off otherwise — most turns don't need it, and the narrower
+sandbox is the safer default.
+
+### A turn runs longer than you want to wait
+
+There is **no time cap per turn** by default (`--turn-timeout 0`); a single
+Codex turn legitimately runs 20+ minutes. Pacing is meant to be bounded by the
+round cap, not the clock. Set a cap explicitly if you need one:
+
+```bash
+duet turn --repo <dir> --turn-timeout 1800    # or: DUET_TURN_TIMEOUT=1800
+```
+
+### The wrong model ran on one side
+
+Every designer log records the model that actually ran; check it before
+assuming. The knobs:
+
+| | |
+| --- | --- |
+| `--codex-model` / `DUET_CODEX_MODEL` | Engineer model. Defaults to whatever `duet init` wrote into `~/.duet/codex-home/config.toml`. |
+| `--claude-model` / `DUET_CLAUDE_MODEL` | Designer model. The skill is instructed to pass the live session's model on every launch; the env default only applies when it doesn't. |
+| `DUET_CLAUDE_FALLBACK_MODEL` | Where the designer continues on quota exhaustion. Empty disables it and fails the turn instead. |
+
+Entry length has no hard cap — it is steered by the output contract plus
+`model_verbosity = "low"` in the duet codex config. See
+[PROTOCOL.md](../PROTOCOL.md#research-notes-why-the-rules-are-shaped-this-way).
+
 ---
 
 ## Relay bounces
