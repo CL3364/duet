@@ -95,13 +95,25 @@ yourself.
 
 ## Three ways to run it
 
-### 1. Interactive — you and Claude are the designer, live
+Two of these are the same conversation and differ in exactly one thing —
+**who plays the designer.** The third is not a conversation at all.
+
+| | Designer is | Loop runs | Designer knows |
+| --- | --- | --- | --- |
+| **Interactive** | **your live Claude session** | one round at a time, gated on you | your whole conversation |
+| **Background** | **a second, headless Claude** | start to finish, unattended | only `.duet/CONTEXT.md` + `DESIGN.md` |
+| **`review`** | nobody — a single Codex pass | no rounds at all | the repo, read-only |
+
+The middle column is the ergonomic difference. The right-hand column is the one
+that decides whether the result is any good.
+
+### 1. Interactive — your live session is the designer
 
 The default, and the one worth learning. Claude does its design work in your
 session where you can steer it, and hands each round to Codex in the
 background.
 
-```
+```text
 You:  /duet — redesign the retry logic in the ingest worker
 ```
 
@@ -119,26 +131,60 @@ Claude then, on its own:
 7. `duet end` on dual SHIP — writes the section summary and wipes Codex's
    session.
 
-### 2. Background — both sides headless
+The loop **stalls between every round** until Claude writes the next entry, so
+the section moves at the speed of your attention. In exchange, the designer is
+the Claude that has heard everything you said, and you can redirect it after
+any round.
 
-For work you want to walk away from. Claude launches it and reports the
-outcome.
+### 2. Background — a second, headless Claude is the designer
 
-```
+```text
 You:  /duet in background — get the flaky auth tests green, 6 rounds max
 ```
 
-Terminates on dual SHIP, `BLOCKED`, or the round cap. Never runs unbounded.
+`duet run` spawns its own Claude to argue with Codex. Your session launches it,
+relays step numbers, and reports the outcome; the loop never waits on you, so
+the rest of the conversation stays free for other work. It terminates on dual
+SHIP, `BLOCKED`, or the round cap — never unbounded.
 
-### 3. One-shot adversarial review
+**What you give up is context, and it is the whole ballgame.** That designer is
+a *separate conversation*. It cannot see yours. It starts cold and knows only
+what is written in `.duet/CONTEXT.md` and `DESIGN.md` at launch — and anything
+you say in your own session while it runs is invisible to it.
 
-No loop, no design phase — a single read-only Codex pass that steelmans your
-design, then hunts for defects in behavior, correctness, cost, and security,
-citing `file:line`. Its session is wiped afterwards.
+In interactive mode a thin CONTEXT.md is survivable, because the designer fills
+the gaps from memory. In background mode a thin CONTEXT.md **is the entire
+brief**, and the designer will confidently guess at whatever you left out.
 
-```
+Two more things worth knowing before choosing it:
+
+- **It costs more Claude, not less.** You pay for two Claude conversations at
+  once — your session plus the headless designer at max effort every round — on
+  top of Codex. Interactive is the economical mode; background buys walk-away
+  convenience with quota. duet ships a sticky fallback model for exactly this
+  reason.
+- **You cannot close the laptop.** Sleep drops the API connections mid-turn and
+  the section lands as `BLOCKED`. `caffeinate` does not prevent lid-close sleep;
+  only clamshell mode does. Nothing is lost — `duet run --continue` resumes from
+  `state.json` — but it will not finish while you are away.
+
+**Choose background when the mission is already fully specified** — when you can
+write down everything that matters before it starts. **Choose interactive when
+the thinking is still live**, because then the designer needs to be the Claude
+that is hearing it.
+
+### 3. One-shot adversarial review — no designer at all
+
+No loop, no design phase, no consensus — a single read-only Codex pass that
+steelmans your design, then hunts for defects in behavior, correctness, cost,
+and security, citing `file:line`. Its session is wiped afterwards.
+
+```text
 You:  /duet review — have GPT check the migration I just wrote
 ```
+
+Cheapest of the three on Claude, since no designer turn ever runs — but nobody
+argues back, so there is no convergence and no agreed conclusion, only findings.
 
 This one earns its keep more often than you'd guess. Pointed at freshly
 written code, it finds the author-blind-spot races that a test suite written
