@@ -1,12 +1,12 @@
-# 3. Driver liveness is a file lease, not process inspection
+## Driver liveness is a file lease, not process inspection
 
 Date: 2026-08-03
 
-## Status
+### Status
 
 Accepted
 
-## Context
+### Context
 
 `duet progress --follow` tails a section's step counter and must exit when that
 section's driver is gone — not when *any* duet process is gone, or a concurrent
@@ -36,7 +36,7 @@ A bounded timeout was considered and rejected: any fixed grace is either long
 enough to strand the user or short enough to cut off a legitimately slow turn,
 and neither answers the actual question.
 
-## Decision
+### Decision
 
 Each driver opens a section-scoped lock file and holds a **shared** `flock` on it
 for its entire process lifetime. The follower probes for an **exclusive** lock,
@@ -52,7 +52,7 @@ never prevent a driver from starting.
 Sections whose logs predate the lease fall back to the old pid inspection, now
 bounded by a finite grace instead of waiting forever.
 
-## Consequences
+### Consequences
 
 **What this buys.** The kernel releases file locks on process death
 unconditionally — including `SIGKILL`, including while the process is still an

@@ -1,12 +1,12 @@
-# 1. The repository is the skill folder
+## The repository is the skill folder
 
 Date: 2026-08-03
 
-## Status
+### Status
 
 Accepted
 
-## Context
+### Context
 
 Anthropic's *Complete Guide to Building Skills for Claude* states two things
 that pull in opposite directions for an open-source skill:
@@ -27,7 +27,7 @@ describes, but it costs a two-step install (clone somewhere, then symlink or
 copy the subdirectory into the skills directory) and it changes an install
 command that is already published.
 
-## Decision
+### Decision
 
 The repository root is the skill folder. `README.md` sits beside `SKILL.md`.
 
@@ -37,7 +37,7 @@ Installation stays one command:
 git clone https://github.com/CL3364/duet.git ~/.claude/skills/duet
 ```
 
-## Consequences
+### Consequences
 
 **What this buys.** One command to install, `git pull` to update, and a single
 directory that is simultaneously the repo, the skill, and — via symlink — the

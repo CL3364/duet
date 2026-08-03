@@ -370,7 +370,7 @@ are in **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**.
 | [CONTEXT.md](CONTEXT.md) | Glossary. One term, one meaning |
 | [docs/PLAYBOOK.md](docs/PLAYBOOK.md) | How to get real work out of the loop |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Every failure and its fix |
-| [docs/adr/](docs/adr/README.md) | Decisions that would otherwise look arbitrary |
+| [docs/decisions/](docs/decisions/README.md) | Decisions that would otherwise look arbitrary |
 | [references/trigger-tests.md](references/trigger-tests.md) | Phrases `/duet` must and must not fire on |
 | `bin/duet` | The relay — one Python file, stdlib only |
 | `prompts/` | The two role prompts, designer and engineer |

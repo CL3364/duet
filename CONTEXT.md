@@ -5,7 +5,8 @@ one meaning. If a word here starts meaning two things, that is a bug in the
 language before it is a bug in the code.
 
 This file is a glossary only. It holds no design decisions (those are in
-[PROTOCOL.md](PROTOCOL.md) and `docs/adr/`) and no implementation detail.
+[PROTOCOL.md](PROTOCOL.md) and [docs/decisions/](docs/decisions/README.md)) and
+no implementation detail.
 
 ---
 

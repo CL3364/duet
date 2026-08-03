@@ -13,8 +13,8 @@ in [CONTEXT.md](../../CONTEXT.md), and the day-to-day guidance in
 Records are immutable once accepted. A decision that changes gets a new record
 that supersedes the old one; the original stays as written.
 
-| # | Decision | Status |
+| Decision | Status | Date |
 | --- | --- | --- |
-| [0001](0001-repo-is-the-skill-folder.md) | The repository is the skill folder | Accepted |
-| [0002](0002-sessions-are-wiped-at-section-end.md) | Codex sessions are destroyed at every section end | Accepted |
-| [0003](0003-driver-liveness-via-file-lease.md) | Driver liveness is a file lease, not process inspection | Accepted |
+| [The repository is the skill folder](repo-is-the-skill-folder.md) | Accepted | 2026-08-03 |
+| [Codex sessions are destroyed at every section end](sessions-are-wiped-at-section-end.md) | Accepted | 2026-08-03 |
+| [Driver liveness is a file lease, not process inspection](driver-liveness-via-file-lease.md) | Accepted | 2026-08-03 |

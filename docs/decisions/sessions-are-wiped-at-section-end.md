@@ -1,12 +1,12 @@
-# 2. Codex sessions are destroyed at every section end
+## Codex sessions are destroyed at every section end
 
 Date: 2026-08-03
 
-## Status
+### Status
 
 Accepted
 
-## Context
+### Context
 
 duet was built against a ChatGPT account shared with other people. Anything the
 Codex CLI writes into its home — session rollouts, history, and in newer
@@ -24,7 +24,7 @@ those rollouts. Destroying them means a section cannot be picked up later inside
 Codex, and it means the reasoning that produced a decision is gone the moment
 the section closes.
 
-## Decision
+### Decision
 
 Every section end wipes the duet Codex home, on **any** outcome — dual SHIP,
 `BLOCKED`, round cap, crash, or interrupt. Exactly five entries survive, none of
@@ -42,7 +42,7 @@ the same place.
 Durable state lives exclusively in local repo files: `DESIGN.md`, `CONTEXT.md`,
 `REVIEW.md`, the section summary, and the code itself.
 
-## Consequences
+### Consequences
 
 **What this buys.** No duet section is recoverable from the shared account. The
 transcript that survives is the one in the repo, which the account's other users
