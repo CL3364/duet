@@ -332,21 +332,6 @@ are in **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**.
 
 ---
 
-## Credits
-
-`duet review` is inspired by [`openai/codex-plugin-cc`][plugin]'s
-`/codex:adversarial-review`, rebuilt on duet's isolation model. That plugin is
-deliberately **not** a dependency and should not be installed alongside duet:
-it runs on `~/.codex`, creates persistent threads resumable in the Codex app,
-and its `/codex:transfer` imports Claude Code transcripts into them — all three
-break the privacy model above.
-
-The protocol's shape is drawn from 2025–26 multi-agent deliberation research
-and both vendors' current prompting guidance; citations are in
-[PROTOCOL.md](PROTOCOL.md#research-notes-why-the-rules-are-shaped-this-way).
-
-[plugin]: https://github.com/openai/codex-plugin-cc
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
